@@ -22,6 +22,8 @@ namespace Reactor
 
     public abstract class UnsafeCustomRpc
     {
+        private static byte LastFragmentId = byte.MaxValue;
+
         public int? Id { get; internal set; }
 
         internal CustomRpcManager Manager { get; set; }
@@ -57,31 +59,81 @@ namespace Reactor
                 UnsafeHandle(netObject, data);
             }
 
-            var writer = immediately switch
-            {
-                false => AmongUsClient.Instance.StartRpc(netObject.NetId, CustomRpcManager.CallId, SendOption),
-                true => AmongUsClient.Instance.StartRpcImmediately(netObject.NetId, CustomRpcManager.CallId, SendOption, targetClientId)
-            };
+            var rpcWriter = MessageWriter.Get(SendOption.None); // plugin header and type data
 
             if (Manager.PluginIdMap.TryGetValue(PluginId, out var pluginId))
             {
-                writer.WritePacked(pluginId);
+                rpcWriter.WritePacked(pluginId);
             }
             else
             {
-                writer.Write(PluginId);
+                rpcWriter.Write(PluginId);
             }
 
-            writer.WritePacked(Id!.Value);
-            UnsafeWrite(writer, data);
+            rpcWriter.WritePacked(Id!.Value);
 
-            if (immediately)
+            UnsafeWrite(rpcWriter, data);
+
+            var rpcData = rpcWriter.ToByteArray(false);
+            rpcWriter.Recycle();
+
+            const int MaxPacketSize = 508, NonImmediateHeaderLength = 5, ImmediateHeaderLength = 15;
+            MessageWriter writer; // fragment writer
+            void NewWriter()
             {
-                AmongUsClient.Instance.FinishRpcImmediately(writer);
+                writer = immediately
+                    ? AmongUsClient.Instance.StartRpcImmediately(netObject.NetId, CustomRpcManager.CallId, SendOption, targetClientId)
+                    : AmongUsClient.Instance.StartRpc(netObject.NetId, CustomRpcManager.CallId, SendOption);
             }
-            else
+
+            var dataLength = rpcData.Length + 1;
+            if (!immediately && dataLength < MaxPacketSize - AmongUsClient.Instance.Streams[(int)SendOption].Length - NonImmediateHeaderLength // non immediate buffer has enough space
+                || immediately && dataLength < MaxPacketSize - ImmediateHeaderLength) // immediate buffer has enough space
             {
-                writer.EndMessage();
+                NewWriter();
+
+                writer.Write(false); // is fragmented
+                writer.Write(rpcData);
+
+                EndRpc();
+            }
+            else // fragment or send non-immediate excess immediately
+            {
+                immediately = true; // StartRpc returns the same MessageWriter, same buffer, and only clears it during FixedUpdate,
+                                    // effectively nullifying the fragmentation.
+
+                var id = LastFragmentId = (byte)(LastFragmentId % byte.MaxValue + 1);
+                var maxSize = MaxPacketSize - ImmediateHeaderLength - 4; // max size per fragment
+                var buffer = new byte[maxSize]; // fragment data buffer
+                var count = (byte)Math.Ceiling((double)dataLength / buffer.Length); // fragment count
+                for (byte i = 0; i < count; i++) // write fragments
+                {
+                    NewWriter();
+
+                    writer.Write(true); // is fragmented
+                    writer.Write(id);
+                    writer.Write(i);
+                    writer.Write(count);
+
+                    var length = Math.Min(rpcData.Length - i * maxSize, maxSize);
+                    if (length != buffer.Length) buffer = new byte[length];
+                    Array.Copy(rpcData, i * maxSize, buffer, 0, buffer.Length);
+                    writer.Write(buffer);
+
+                    EndRpc();
+                }
+            }
+
+            void EndRpc()
+            {
+                if (immediately)
+                {
+                    AmongUsClient.Instance.FinishRpcImmediately(writer);
+                }
+                else
+                {
+                    writer.EndMessage();
+                }
             }
 
             if (LocalHandling == RpcLocalHandling.After)
@@ -220,24 +272,98 @@ namespace Reactor
                 return output;
             }
 
+            private class FragmentedRpc
+            {
+                public readonly uint Sender;
+                public readonly byte Id, Count;
+
+                public readonly byte[][] Buffers;
+
+                private byte Index = 0;
+
+                public bool IsComplete { get { return Index == Count; } }
+
+                public FragmentedRpc(uint sender, byte id, byte count)
+                {
+                    Sender = sender;
+                    Id = id;
+                    Count = count;
+
+                    Buffers = new byte[Count][];
+                }
+
+                public void AddFragment(byte index, byte[] fragment)
+                {
+                    if (IsComplete || index >= Count) return;
+
+                    Buffers[index] = fragment;
+
+                    Index++;
+                }
+
+                public byte[] Rebuild()
+                {
+                    if (!IsComplete) return null; // throw exception?
+
+                    return Buffers.SelectMany(b => b).ToArray();
+                }
+            }
+
+            private static List<FragmentedRpc> FragmentedRpcs = new List<FragmentedRpc>();
             public static bool Prefix(InnerNetObject __instance, [HarmonyArgument(0)] byte callId, [HarmonyArgument(1)] MessageReader reader)
             {
                 if (callId == CallId)
                 {
-                    var manager = PluginSingleton<ReactorPlugin>.Instance.CustomRpcManager;
-                    var customRpcs = manager.Map[__instance.GetType()];
+                    void ReadRpc()
+                    {
+                        var manager = PluginSingleton<ReactorPlugin>.Instance.CustomRpcManager;
+                        var customRpcs = manager.Map[__instance.GetType()];
 
-                    var lengthOrShortId = reader.ReadPackedInt32();
+                        var lengthOrShortId = reader.ReadPackedInt32();
 
-                    var pluginId = lengthOrShortId < 0
-                        ? manager.PluginIdMapReversed[lengthOrShortId]
-                        : ReadString(reader, lengthOrShortId);
+                        var pluginId = lengthOrShortId < 0
+                            ? manager.PluginIdMapReversed[lengthOrShortId]
+                            : ReadString(reader, lengthOrShortId);
 
-                    var id = reader.ReadPackedInt32();
+                        var id = reader.ReadPackedInt32();
 
-                    var customRpc = customRpcs.Single(x => x.PluginId == pluginId && x.Id == id);
+                        var customRpc = customRpcs.Single(x => x.PluginId == pluginId && x.Id == id);
 
-                    customRpc.UnsafeHandle(__instance, customRpc.UnsafeRead(reader));
+                        customRpc.UnsafeHandle(__instance, customRpc.UnsafeRead(reader));
+                    }
+
+                    if (reader.ReadBoolean()) // is fragmented
+                    {
+                        var id = reader.ReadByte();
+                        var index = reader.ReadByte();
+                        var count = reader.ReadByte();
+
+                        var fragmentedRpc = FragmentedRpcs.SingleOrDefault(fragment => fragment.Sender == __instance.NetId && fragment.Id == id);
+                        if (fragmentedRpc == null) // first fragment received
+                        {
+                            fragmentedRpc = new FragmentedRpc(__instance.NetId, id, count);
+
+                            FragmentedRpcs.Add(fragmentedRpc);
+                        }
+
+                        fragmentedRpc.AddFragment(index, reader.ReadBytes(reader.BytesRemaining));
+
+                        if (fragmentedRpc.IsComplete) // all fragments received
+                        {
+                            FragmentedRpcs.Remove(fragmentedRpc);
+
+                            reader.Buffer = fragmentedRpc.Rebuild();
+                            reader.Offset = reader.Position = 0;
+                            reader.Length = reader.Buffer.Length;
+                            reader.Tag = byte.MaxValue;
+
+                            ReadRpc();
+                        }
+                    }
+                    else
+                    {
+                        ReadRpc();
+                    }
 
                     return false;
                 }
